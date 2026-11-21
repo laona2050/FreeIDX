@@ -1,0 +1,157 @@
+name: CF Usage Analytics
+
+# 只读用量分析：用 Cloudflare GraphQL Analytics API（不占 D1 配额）查询
+# 账号下所有 D1 数据库与 Workers 的真实用量，定位配额消耗大户。
+# 不部署、不写任何数据。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  usage:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 查询账号 D1 数据库清单
+        run: |
+          ACC="$CLOUDFLARE_ACCOUNT_ID"
+          echo "=== D1 数据库列表 ==="
+          curl -sS "https://api.cloudflare.com/client/v4/accounts/$ACC/d1/database?per_page=100" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" > /tmp/d1list.json
+          node -e '
+            const d = require("/tmp/d1list.json");
+            if (!d.success) { console.log("API失败:", JSON.stringify(d.errors)); process.exit(0); }
+            for (const db of d.result) {
+              console.log(`${db.name}  uuid=${db.uuid}  size=${(db.file_size/1024/1024).toFixed(2)}MB  version=${db.version ?? "?"}`);
+            }
+            console.log("total:", d.result_info?.total_count ?? d.result.length);
+          '
+
+      - name: GraphQL 查询今日各库行读写用量
+        run: |
+          node - <<'EOF'
+          const https = require("https");
+          const fs = require("fs");
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const acc = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const d1list = JSON.parse(fs.readFileSync("/tmp/d1list.json", "utf8"));
+          const dbs = (d1list.result || []).map(d => ({ name: d.name, uuid: d.uuid }));
+
+          // 今天（UTC）0 点起的逐小时聚合； graphql 已知维度：datetimeHour
+          const now = new Date();
+          const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+          const q = (uuid) => `{
+            viewer {
+              accounts(filter: {accountTag: "${acc}"}) {
+                d1AnalyticsAdaptiveGroups(
+                  limit: 100,
+                  filter: {
+                    databaseId: "${uuid}",
+                    datetime_geq: "${start.toISOString()}",
+                    datetime_lt: "${now.toISOString()}"
+                  },
+                  orderBy: [datetimeHour_ASC]
+                ) {
+                  dimensions { datetimeHour }
+                  sum { rowsRead rowsWritten }
+                  count
+                }
+              }
+            }
+          }`;
+
+          function gql(query) {
+            return new Promise((resolve, reject) => {
+              const body = JSON.stringify({ query });
+              const req = https.request({
+                hostname: "api.cloudflare.com", path: "/client/v4/graphql", method: "POST",
+                headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
+              }, (res) => {
+                let s = ""; res.on("data", c => s += c); res.on("end", () => { try { resolve(JSON.parse(s)); } catch (e) { reject(e); } });
+              });
+              req.on("error", reject); req.write(body); req.end();
+            });
+          }
+
+          (async () => {
+            let grandTotalRead = 0, grandTotalWrite = 0;
+            for (const db of dbs) {
+              const r = await gql(q(db.uuid));
+              const groups = r?.data?.viewer?.accounts?.[0]?.d1AnalyticsAdaptiveGroups || [];
+              const rr = groups.reduce((n, g) => n + (g.sum.rowsRead || 0), 0);
+              const rw = groups.reduce((n, g) => n + (g.sum.rowsWritten || 0), 0);
+              grandTotalRead += rr; grandTotalWrite += rw;
+              console.log(`\n### ${db.name} (${db.uuid})`);
+              console.log(`  今日累计: rowsRead=${rr}  rowsWritten=${rw}`);
+              for (const g of groups.slice(-12)) {
+                console.log(`  ${g.dimensions.datetimeHour}  read=${g.sum.rowsRead}  write=${g.sum.rowsWritten}  reqs=${g.count}`);
+              }
+              if (r.errors) console.log("  graphql errors:", JSON.stringify(r.errors).slice(0, 200));
+            }
+            console.log(`\n===== 账号今日合计: rowsRead=${grandTotalRead} rowsWritten=${grandTotalWrite} =====`);
+          })();
+          EOF
+
+      - name: GraphQL 查询今日各 Worker 请求量
+        run: |
+          node - <<'EOF'
+          const https = require("https");
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const acc = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const now = new Date();
+          const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+          const q = `{
+            viewer {
+              accounts(filter: {accountTag: "${acc}"}) {
+                workersInvocationsAdaptive(
+                  limit: 100,
+                  filter: {
+                    datetimeHour_geq: "${start.toISOString()}",
+                    datetimeHour_lt: "${now.toISOString()}"
+                  }
+                ) {
+                  sum { requests subrequests errors }
+                  dimensions { scriptName datetimeHour }
+                }
+              }
+            }
+          }`;
+          function gql(query) {
+            return new Promise((resolve, reject) => {
+              const body = JSON.stringify({ query });
+              const req = https.request({
+                hostname: "api.cloudflare.com", path: "/client/v4/graphql", method: "POST",
+                headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
+              }, (res) => {
+                let s = ""; res.on("data", c => s += c); res.on("end", () => { try { resolve(JSON.parse(s)); } catch (e) { reject(e); } });
+              });
+              req.on("error", reject); req.write(body); req.end();
+            });
+          }
+          (async () => {
+            const r = await gql(q);
+            const groups = r?.data?.viewer?.accounts?.[0]?.workersInvocationsAdaptive || [];
+            const byScript = {};
+            for (const g of groups) {
+              const k = g.dimensions.scriptName;
+              byScript[k] = byScript[k] || { requests: 0, errors: 0 };
+              byScript[k].requests += g.sum.requests || 0;
+              byScript[k].errors += g.sum.errors || 0;
+            }
+            console.log("=== 今日各 Worker 请求量 ===");
+            for (const [k, v] of Object.entries(byScript).sort((a, b) => b[1].requests - a[1].requests)) {
+              console.log(`${k}: requests=${v.requests} errors=${v.errors}`);
+            }
+            if (r.errors) console.log("graphql errors:", JSON.stringify(r.errors).slice(0, 300));
+          })();
+          EOF
