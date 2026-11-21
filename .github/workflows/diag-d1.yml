@@ -1,0 +1,103 @@
+name: D1 Read-only Diagnosis
+
+# 只读诊断：绝不部署、绝不变更数据。手动触发（workflow_dispatch），
+# 用仓库已配置的 CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID 检查 D1 状态。
+# 所有 SQL 均为 SELECT / PRAGMA，不写入任何行。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 前置检查
+        run: |
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "::error::缺少 Secret CLOUDFLARE_API_TOKEN"; exit 1; }
+          [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || { echo "::error::缺少 Secret CLOUDFLARE_ACCOUNT_ID"; exit 1; }
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 解析真实 database_id 并回填 wrangler.toml
+        working-directory: apps/api
+        run: |
+          set -euo pipefail
+          d1_id() {
+            npx wrangler d1 list --json 2>/dev/null | node -e '
+              let s = "";
+              process.stdin.on("data", c => s += c).on("end", () => {
+                const hit = JSON.parse(s).find(x => x.name === "freeidx");
+                process.stdout.write(hit ? hit.uuid : "");
+              });'
+          }
+          DB=$(d1_id || true)
+          echo "D1 uuid = [$DB]"
+          if [ -z "$DB" ] || [ "$DB" = "null" ]; then
+            echo "::error::D1 数据库 freeidx 不存在（可能已被删除）"
+            npx wrangler d1 list || true
+            exit 1
+          fi
+          sed -i -E "s|^database_id = .*|database_id = \"$DB\"|" wrangler.toml
+          grep '^database_id' wrangler.toml
+
+      - name: ① 远端未应用迁移清单
+        working-directory: apps/api
+        run: |
+          echo "=== d1 migrations list --remote ==="
+          npx wrangler d1 migrations list freeidx --remote 2>&1 | tee /tmp/mig.txt || true
+          if grep -q "No migrations" /tmp/mig.txt; then echo "→ 全部已应用"; fi
+
+      - name: ② 核心表存在性与行数
+        working-directory: apps/api
+        run: |
+          cat > /tmp/diag1.sql <<'EOF'
+          SELECT 'bbs_thread' AS tbl, COUNT(*) AS n FROM bbs_thread
+          UNION ALL SELECT 'bbs_post', COUNT(*) FROM bbs_post
+          UNION ALL SELECT 'bbs_user', COUNT(*) FROM bbs_user
+          UNION ALL SELECT 'bbs_forum', COUNT(*) FROM bbs_forum
+          UNION ALL SELECT 'bbs_kv', COUNT(*) FROM bbs_kv
+          UNION ALL SELECT 'bbs_announcement', COUNT(*) FROM bbs_announcement;
+          EOF
+          npx wrangler d1 execute freeidx --remote --file=/tmp/diag1.sql --json 2>&1 | tee /tmp/t1.json || \
+            echo "::warning::核心表查询失败（表可能缺失或库不可用）"
+
+      - name: ③ bbs_thread 表结构（列清单）
+        working-directory: apps/api
+        run: |
+          cat > /tmp/diag2.sql <<'EOF'
+          PRAGMA table_info(bbs_thread);
+          EOF
+          npx wrangler d1 execute freeidx --remote --file=/tmp/diag2.sql --json 2>&1 | tee /tmp/t2.json || true
+
+      - name: ④ 复现业务查询（threads 列表投影，只读）
+        working-directory: apps/api
+        run: |
+          cat > /tmp/diag3.sql <<'EOF'
+          SELECT tid,fid,top,digest,closed,uid,username,avatar,subject,posts,views,images,files,lastpid,lastuid,lastusername,create_date,last_date,ok,content_buy,content_buy_type,tags,image_urls,summary,lang
+          FROM bbs_thread ORDER BY tid DESC LIMIT 5;
+          EOF
+          npx wrangler d1 execute freeidx --remote --file=/tmp/diag3.sql --json 2>&1 | tee /tmp/t3.json || true
+
+      - name: ⑤ 读取诊断结果
+        if: always()
+        run: |
+          echo "================ 诊断汇总 ================"
+          for f in /tmp/mig.txt /tmp/t1.json /tmp/t2.json /tmp/t3.json; do
+            echo "----- $f -----"
+            if [ -s "$f" ]; then head -c 3000 "$f"; echo; else echo "(空/未生成)"; fi
+          done
